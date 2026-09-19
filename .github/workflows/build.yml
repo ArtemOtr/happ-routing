@@ -1,0 +1,130 @@
+name: Build geo-files and Happ routing
+
+on:
+  schedule:
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "config/**"
+      - "custom/**"
+      - "scripts/**"
+      - "tests/**"
+      - "requirements-ci.txt"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: happ-routing-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Test generators
+        run: python -m unittest discover -s tests -v
+
+      - name: Fetch upstream builders and lists
+        run: |
+          git clone --depth 1 https://github.com/v2fly/domain-list-community.git dlc
+          git clone --depth 1 https://github.com/hydraponique/roscomvpn-geosite.git rvpn-geosite
+          git clone --depth 1 https://github.com/v2fly/geoip.git geoip-tool
+
+      - name: Set up Go required by the current upstream
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: geoip-tool/go.mod
+          cache: false
+
+      - name: Generate custom lists from opencck
+        run: python scripts/fetch_opencck.py --outdir build
+
+      - name: Build geosite.dat
+        run: |
+          cp -a rvpn-geosite/data/. dlc/data/
+          cp build/russia-inside dlc/data/russia-inside
+          mkdir -p release
+          cd dlc
+          go run ./ \
+            --datapath=./data \
+            --outputname=geosite.dat \
+            --outputdir="$GITHUB_WORKSPACE/release"
+
+      - name: Build geoip.dat
+        run: |
+          curl --fail --show-error --location \
+            --retry 3 --retry-all-errors \
+            --output geoip-tool/upstream-geoip.dat \
+            https://github.com/hydraponique/roscomvpn-geoip/releases/latest/download/geoip.dat
+          cp build/russia-inside.txt geoip-tool/russia-inside.txt
+          cp config/geoip-build.json geoip-tool/config-custom.json
+          cd geoip-tool
+          go run ./ -c config-custom.json
+          cp output/geoip.dat "$GITHUB_WORKSPACE/release/geoip.dat"
+
+      - name: Check whether geo files changed
+        id: changes
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]] && \
+             [[ -z "$(git status --porcelain -- release/geosite.dat release/geoip.dat)" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Geo files did not change; skipping the scheduled release."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Happ profile and QR code
+        if: steps.changes.outputs.skip == 'false'
+        id: routing
+        shell: bash
+        run: |
+          tag="$(date -u +%Y%m%d%H%M%S)"
+          timestamp="$(date -u +%s)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          python scripts/build_routing.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --last-updated "$timestamp"
+          python -m pip install --disable-pip-version-check --requirement requirements-ci.txt
+          python scripts/make_qr.py HAPP/ROUTING.DEEPLINK HAPP/ROUTING.QR.png
+
+      - name: Commit generated files and tag
+        if: steps.changes.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.routing.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A HAPP release
+          git commit -m "build: ${TAG}"
+          git tag "$TAG"
+          git push origin "HEAD:${GITHUB_REF_NAME}" --follow-tags
+
+      - name: Publish GitHub Release
+        if: steps.changes.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.routing.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            release/geosite.dat \
+            release/geoip.dat \
+            --title "Happ routing ${TAG}" \
+            --notes "Automated Happ GeoSite and GeoIP build."
